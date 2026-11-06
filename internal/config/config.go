@@ -6,7 +6,6 @@ import (
 )
 
 // Config is everything the process reads from the environment.
-// Only PORT has a default so far; the other values are filled in by later steps.
 type Config struct {
 	Port        string
 	DatabaseURL string
@@ -14,8 +13,12 @@ type Config struct {
 	APIKey      string
 }
 
-// Load reads configuration from the environment.
+// Load reads a local .env file, then environment variables.
+// Only PORT has a default. DATABASE_URL is required once the server starts.
 func Load() (Config, error) {
+	if err := loadDotEnv(); err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		Port:        getenv("PORT", "8080"),
 		DatabaseURL: os.Getenv("DATABASE_URL"),
