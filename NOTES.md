@@ -40,3 +40,27 @@ A connection pool (`pgxpool.Pool`) maintains reusable, pre-warmed TCP connection
 1. *Why use an advisory lock during migrations?* In a multi-replica deployment (Kubernetes/ECS), multiple containers start simultaneously. Without an advisory lock, replicas race to run migrations, causing duplicate execution or catalog deadlocks.
 2. *Why pass a `Pinger` interface to the health handler instead of the concrete pool?* Interface segregation. Handlers only require a `Ping(ctx)` method. This allows unit testing with a mock/stub (`stubDB`) without needing a real database.
 3. *What is the difference between a liveness check and a readiness check?* A liveness check detects hung processes to trigger restarts. A readiness check (like our database ping) tells the load balancer whether the instance can currently serve customer requests; returning 503 drops it from traffic rotation without forcibly killing the container.
+
+## Step 3: API key authentication and endpoint registration
+
+We compare API keys in constant time (`crypto/subtle.ConstantTimeCompare`) because normal string comparison (`==`) short-circuits at the first differing byte. An attacker measuring millisecond/microsecond response variations over repeated calls can determine correct characters sequentially (timing attack). Constant-time evaluation always checks every byte. The webhook signing secret is shown only once on creation so read-only dashboard users or compromised list queries cannot steal secrets and forge webhook payloads.
+
+**Flow through the code:**
+1. Incoming requests enter `handlers.RequireAuth(apiKey)` in `internal/handlers/auth.go`. If the path is `/health`, it skips auth immediately. Otherwise, it inspects the `Authorization: Bearer <key>` header, compares via `subtle.ConstantTimeCompare`, and returns a 401 JSON error via `jsonutil.Error` if missing or wrong.
+2. For `POST /endpoints`, `handlers.CreateEndpoint` in `internal/handlers/endpoints.go` decodes the JSON body and validates that the URL has an `http` or `https` scheme with a valid host.
+3. `handlers.GenerateSecret()` uses `crypto/rand` to generate 32 cryptographically secure random bytes, hex-encoded (64 characters).
+4. The handler calls `store.Create(...)` (implemented by `db.EndpointRepo` in `internal/db/endpoints.go`), inserting into Postgres and returning the endpoint with `id`, `url`, `secret`, and `created_at`.
+5. For `GET /endpoints` and `GET /endpoints/{id}`, the repository explicitly omits the `secret` column from SQL queries, and the handler returns 200 with the secret field omitted (`omitempty`). `GET /endpoints/{id}` validates the UUID regex first, returning 400 if malformed.
+
+**Design decisions:**
+- Repository pattern: Database SQL queries are isolated in `internal/db/endpoints.go`. Handlers consume a small `EndpointStore` interface, decoupling HTTP routing from pgx and enabling mock-based unit tests.
+- Reusable `jsonutil` package: Ensures consistent JSON serialization and error formatting `{"error":"..."}` across all endpoints.
+
+**What could go wrong in production:**
+- Memory exhaustion if `GET /endpoints` returns tens of thousands of records without pagination (addressed in later steps).
+- SSRF (Server-Side Request Forgery) if customer endpoints target private network addresses (e.g., `http://169.254.169.254` or `http://localhost`). Private IP filtering should be added before delivery workers send requests.
+
+**Interview questions:**
+1. *What is a timing attack on string comparison, and how does Go prevent it?* Standard equality exits early on the first mismatched byte, creating measurable latency differences. `subtle.ConstantTimeCompare` performs a bitwise XOR over all bytes regardless of mismatches, returning `1` only if identical, leaking zero timing clues.
+2. *Why define an `EndpointStore` interface in the handlers package rather than depending directly on `*db.EndpointRepo`?* In Go, consumers define interfaces. This enables complete test isolation—handlers can be unit-tested using an in-memory mock store without spinning up Postgres or executing real queries.
+3. *Why should webhook signing secrets never be returned in GET requests?* Secrets are symmetric keys used to sign outgoing webhook payloads. Exposing them in read operations violates the principle of least privilege; any read-only credential or log leak exposes customers to payload forgery.

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -31,6 +32,10 @@ func run() error {
 		return err
 	}
 
+	if cfg.APIKey == "" {
+		return fmt.Errorf("API_KEY must not be empty")
+	}
+
 	// Startup uses its own timeout so a missing database fails fast,
 	// instead of waiting on the shutdown signal.
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 15*time.Second)
@@ -50,12 +55,19 @@ func run() error {
 		return err
 	}
 
+	endpointRepo := db.NewEndpointRepo(pool)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handlers.Health(pool))
+	mux.HandleFunc("POST /endpoints", handlers.CreateEndpoint(endpointRepo))
+	mux.HandleFunc("GET /endpoints", handlers.ListEndpoints(endpointRepo))
+	mux.HandleFunc("GET /endpoints/{id}", handlers.GetEndpoint(endpointRepo))
+
+	handler := handlers.RequireAuth(cfg.APIKey)(mux)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
