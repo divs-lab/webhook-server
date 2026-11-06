@@ -1,3 +1,3 @@
-module github.com/divyasingh5028/webhook-service
+module github.com/divs-lab/webhook-server
 
 go 1.27.3
