@@ -64,3 +64,30 @@ We compare API keys in constant time (`crypto/subtle.ConstantTimeCompare`) becau
 1. *What is a timing attack on string comparison, and how does Go prevent it?* Standard equality exits early on the first mismatched byte, creating measurable latency differences. `subtle.ConstantTimeCompare` performs a bitwise XOR over all bytes regardless of mismatches, returning `1` only if identical, leaking zero timing clues.
 2. *Why define an `EndpointStore` interface in the handlers package rather than depending directly on `*db.EndpointRepo`?* In Go, consumers define interfaces. This enables complete test isolation—handlers can be unit-tested using an in-memory mock store without spinning up Postgres or executing real queries.
 3. *Why should webhook signing secrets never be returned in GET requests?* Secrets are symmetric keys used to sign outgoing webhook payloads. Exposing them in read operations violates the principle of least privilege; any read-only credential or log leak exposes customers to payload forgery.
+
+## Step 4: Event submission with idempotency keys
+
+Idempotency means performing the same operation multiple times yields the exact same outcome as running it once ($f(f(x)) = f(x)$). In distributed systems, network drops or timeouts frequently occur after a server processes a request but before the client receives the acknowledgement. Without idempotency, client retries would cause duplicate billing charges or redundant webhook deliveries. With an idempotency key, retries safely return the original event without creating duplicate records.
+
+**Flow through the code:**
+1. Incoming requests enter `handlers.CreateEvent` in `internal/handlers/events.go`. It checks the required `Idempotency-Key` header (returning 400 if missing or blank).
+2. The request body is wrapped in `http.MaxBytesReader(w, r.Body, 1<<20)`, capping the stream at 1 MB. An oversized payload immediately returns 413 or 400.
+3. The JSON body is parsed into `endpoint_id` (UUID regex verified) and `payload` (JSON verified).
+4. `store.EndpointExists(ctx, endpointID)` verifies the target endpoint exists in Postgres; if not, it returns 404.
+5. `store.InsertEvent(...)` runs an atomic CTE in `internal/db/events.go`:
+   `INSERT INTO events ... ON CONFLICT (endpoint_id, idempotency_key) DO NOTHING RETURNING ... UNION ALL SELECT ... WHERE NOT EXISTS (...)`.
+6. If the record was newly inserted (`is_new = true`), the handler returns `201 Created`. If an existing row matched the idempotency key (`is_new = false`), it returns `200 OK` with the existing event record.
+7. `GET /events/{id}` validates the UUID format and queries `store.GetEvent`, returning 200 or 404.
+
+**Design decisions:**
+- Atomic CTE with `ON CONFLICT` over `SELECT` followed by `INSERT`: A check-then-insert pattern suffers from Time-Of-Check to Time-Of-Use (TOCTOU) race conditions under high concurrency. PostgreSQL's unique constraint index guarantees serializable conflict resolution at the storage layer without application locks.
+- Storing payload as `jsonb`: Preserves JSON structure, validates syntax at the database boundary, and enables fast indexing and querying.
+
+**What could go wrong in production:**
+- Idempotency key reuse with different payloads: If a client generates a static key and sends differing payloads, the server silently returns the original event. Production systems (like Stripe) hash the incoming payload and return an error if a matching key has a conflicting payload hash.
+- Unbounded storage growth: Old events accumulate indefinitely. A TTL or archiving policy is required to prevent database disk exhaustion.
+
+**Interview questions:**
+1. *Why use an atomic upsert/CTE instead of a SELECT then INSERT in application code?* A `SELECT` then `INSERT` introduces a race condition. If two identical requests arrive simultaneously across two server instances, both select nothing, both attempt insertion, and one fails with a unique constraint violation error. An atomic `ON CONFLICT` query handles this deterministically inside Postgres.
+2. *How does `http.MaxBytesReader` prevent DoS attacks?* It limits the number of bytes read from the underlying TCP connection socket. If a client attempts to stream a multi-gigabyte file, the reader halts reading, returns a `MaxBytesError`, and allows closing the connection without exhausting server RAM.
+3. *What status codes should an idempotent creation endpoint return?* HTTP `201 Created` on the initial successful creation, and HTTP `200 OK` on subsequent identical retries. Both responses return the same resource payload.

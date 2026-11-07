@@ -56,12 +56,15 @@ func run() error {
 	}
 
 	endpointRepo := db.NewEndpointRepo(pool)
+	eventRepo := db.NewEventRepo(pool)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handlers.Health(pool))
 	mux.HandleFunc("POST /endpoints", handlers.CreateEndpoint(endpointRepo))
 	mux.HandleFunc("GET /endpoints", handlers.ListEndpoints(endpointRepo))
 	mux.HandleFunc("GET /endpoints/{id}", handlers.GetEndpoint(endpointRepo))
+	mux.HandleFunc("POST /events", handlers.CreateEvent(eventRepo))
+	mux.HandleFunc("GET /events/{id}", handlers.GetEvent(eventRepo))
 
 	handler := handlers.RequireAuth(cfg.APIKey)(mux)
 
