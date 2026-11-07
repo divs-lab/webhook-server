@@ -91,3 +91,30 @@ Idempotency means performing the same operation multiple times yields the exact 
 1. *Why use an atomic upsert/CTE instead of a SELECT then INSERT in application code?* A `SELECT` then `INSERT` introduces a race condition. If two identical requests arrive simultaneously across two server instances, both select nothing, both attempt insertion, and one fails with a unique constraint violation error. An atomic `ON CONFLICT` query handles this deterministically inside Postgres.
 2. *How does `http.MaxBytesReader` prevent DoS attacks?* It limits the number of bytes read from the underlying TCP connection socket. If a client attempts to stream a multi-gigabyte file, the reader halts reading, returns a `MaxBytesError`, and allows closing the connection without exhausting server RAM.
 3. *What status codes should an idempotent creation endpoint return?* HTTP `201 Created` on the initial successful creation, and HTTP `200 OK` on subsequent identical retries. Both responses return the same resource payload.
+
+## Step 5: RabbitMQ queue and asynchronous delivery worker
+
+At-least-once delivery means the system guarantees that every message published will be delivered to a consumer at least once; under failure conditions (crashes, network drops), messages may be redelivered. We ACK only after the database update succeeds so that if a worker crashes mid-delivery or during the DB write, RabbitMQ detects the closed connection and redelivers the unacknowledged job to another worker, guaranteeing zero data loss.
+
+**Flow through the code:**
+1. In `POST /events`, once `store.InsertEvent` completes with `isNew == true`, `queue.Publisher.Publish` writes the event ID as a persistent message to the durable `events.deliver` queue. If enqueueing fails, it returns 500 so the client can safely retry with the same idempotency key.
+2. Duplicate event submissions (`isNew == false`) bypass enqueueing and return 200 immediately.
+3. `cmd/worker/main.go` runs `queue.Consumer.Consume` configured with a prefetch count of 10.
+4. For each message, `delivery.Service.DeliverEvent` in `internal/delivery/deliver.go` loads the event and endpoint from Postgres.
+5. It sends an HTTP POST request to the destination URL with a 10s timeout, `Content-Type: application/json`, and `X-Event-Id` header.
+6. If the receiver returns 2xx, the event status is updated to `delivered`. On non-2xx status codes, timeouts, or connection errors, the status is updated to `failed`.
+7. Once the database status update completes, the consumer invokes `d.Ack(false)`.
+8. On `SIGINT`/`SIGTERM`, the worker stops queue consumption and grants in-flight deliveries up to 30s to finish before exiting cleanly.
+
+**Design decisions:**
+- Queue-based worker vs in-process HTTP dispatch: Calling customer webhook URLs inside the API handler would block HTTP worker threads, degrade API latency, and risk cascading outages when external endpoints are slow or down. RabbitMQ decouples ingestion from delivery.
+- Claim-check pattern: Only the event ID (not the full payload) is published to RabbitMQ. This avoids memory bloat in the message broker while keeping Postgres as the single source of truth.
+
+**What could go wrong in production:**
+- Poison messages: An event with an invalid payload or crash-inducing bug could trigger endless requeuing cycles (addressed in Step 7 with retry limits and Dead-Letter Queues).
+- Worker starvation: A slow customer receiver taking 10s per request could consume worker concurrency slots, delaying other customers' webhooks (addressed in Step 8 with rate limiters).
+
+**Interview questions:**
+1. *What is prefetch count (QoS) and why set it to 10?* Prefetch limits unacknowledged messages assigned to a worker channel. Without it, RabbitMQ pushes the entire queue to the first connected worker, starving other workers and risking out-of-memory crashes. A prefetch of 10 balances high throughput with fair distribution.
+2. *Why ACK only after the database update?* If a worker ACKs upon receiving the message or before the DB write, and then crashes, the job is erased from RabbitMQ with no record in Postgres. Acknowledging after the DB write ensures RabbitMQ redelivers the message if a crash occurs.
+3. *Why publish only the event ID to RabbitMQ rather than the entire payload?* RabbitMQ stores queues in RAM. Publishing small IDs minimizes broker memory pressure, while Postgres reliably stores the payloads. It also ensures workers always deliver the most up-to-date database state.

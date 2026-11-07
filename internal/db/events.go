@@ -106,3 +106,19 @@ func (r *EventRepo) GetEvent(ctx context.Context, id string) (Event, error) {
 	ev.Payload = json.RawMessage(rawPayload)
 	return ev, nil
 }
+
+// UpdateStatus updates the delivery status of an event ('delivered' or 'failed').
+func (r *EventRepo) UpdateStatus(ctx context.Context, id string, status string) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE events
+		SET status = $1
+		WHERE id = $2
+	`, status, id)
+	if err != nil {
+		return fmt.Errorf("update event status: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}

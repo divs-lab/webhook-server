@@ -19,14 +19,19 @@ type EventStore interface {
 	GetEvent(ctx context.Context, id string) (db.Event, error)
 }
 
+// QueuePublisher abstracts enqueuing delivery tasks into the message broker.
+type QueuePublisher interface {
+	Publish(ctx context.Context, eventID string) error
+}
+
 type createEventRequest struct {
 	EndpointID string          `json:"endpoint_id"`
 	Payload    json.RawMessage `json:"payload"`
 }
 
 // CreateEvent handles POST /events with a required Idempotency-Key and 1 MB max body size.
-// Returns 201 Created for a new event or 200 OK for an existing event with the same idempotency key.
-func CreateEvent(store EventStore) http.HandlerFunc {
+// Returns 201 Created for a new event (and publishes to RabbitMQ) or 200 OK for a duplicate key.
+func CreateEvent(store EventStore, publisher QueuePublisher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 		if idempotencyKey == "" {
@@ -77,12 +82,22 @@ func CreateEvent(store EventStore) http.HandlerFunc {
 			return
 		}
 
-		status := http.StatusOK
+		// Publish only for newly inserted events (never for duplicates)
 		if isNew {
-			status = http.StatusCreated
+			if publisher != nil {
+				if err := publisher.Publish(r.Context(), ev.ID); err != nil {
+					slog.Error("failed to enqueue event delivery", "event_id", ev.ID, "error", err)
+					jsonutil.Error(w, http.StatusInternalServerError, "failed to enqueue event delivery")
+					return
+				}
+			}
+			if err := jsonutil.Write(w, http.StatusCreated, ev); err != nil {
+				slog.Error("failed to write response", "error", err)
+			}
+			return
 		}
 
-		if err := jsonutil.Write(w, status, ev); err != nil {
+		if err := jsonutil.Write(w, http.StatusOK, ev); err != nil {
 			slog.Error("failed to write response", "error", err)
 		}
 	}

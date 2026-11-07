@@ -68,13 +68,27 @@ func (m *mockEventStore) GetEvent(ctx context.Context, id string) (db.Event, err
 	return ev, nil
 }
 
+type mockPublisher struct {
+	published []string
+	err       error
+}
+
+func (m *mockPublisher) Publish(ctx context.Context, eventID string) error {
+	if m.err != nil {
+		return m.err
+	}
+	m.published = append(m.published, eventID)
+	return nil
+}
+
 func TestCreateEvent(t *testing.T) {
 	validEndpointID := "550e8400-e29b-41d4-a716-446655440000"
 
-	t.Run("new event returns 201", func(t *testing.T) {
+	t.Run("new event returns 201 and publishes event id", func(t *testing.T) {
 		store := newMockEventStore()
 		store.endpoints[validEndpointID] = true
-		handler := CreateEvent(store)
+		pub := &mockPublisher{}
+		handler := CreateEvent(store, pub)
 
 		body := `{"endpoint_id":"` + validEndpointID + `","payload":{"order_id":123,"total":99.9}}`
 		req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewBufferString(body))
@@ -97,12 +111,34 @@ func TestCreateEvent(t *testing.T) {
 		if ev.Status != "pending" {
 			t.Errorf("status = %q, want pending", ev.Status)
 		}
+		if len(pub.published) != 1 || pub.published[0] != ev.ID {
+			t.Errorf("published = %v, want [%s]", pub.published, ev.ID)
+		}
 	})
 
-	t.Run("duplicate key returns 200 with the same id", func(t *testing.T) {
+	t.Run("publish failure returns 500", func(t *testing.T) {
 		store := newMockEventStore()
 		store.endpoints[validEndpointID] = true
-		handler := CreateEvent(store)
+		pub := &mockPublisher{err: context.DeadlineExceeded}
+		handler := CreateEvent(store, pub)
+
+		body := `{"endpoint_id":"` + validEndpointID + `","payload":{"order_id":123}}`
+		req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewBufferString(body))
+		req.Header.Set("Idempotency-Key", "fail-publish-key")
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+		}
+	})
+
+	t.Run("duplicate key returns 200 with the same id without re-publishing", func(t *testing.T) {
+		store := newMockEventStore()
+		store.endpoints[validEndpointID] = true
+		pub := &mockPublisher{}
+		handler := CreateEvent(store, pub)
 
 		body := `{"endpoint_id":"` + validEndpointID + `","payload":{"order_id":123}}`
 
@@ -116,6 +152,10 @@ func TestCreateEvent(t *testing.T) {
 		}
 		var ev1 db.Event
 		_ = json.NewDecoder(rec1.Body).Decode(&ev1)
+
+		if len(pub.published) != 1 {
+			t.Fatalf("published count after req1 = %d, want 1", len(pub.published))
+		}
 
 		// Request 2: Duplicate key -> 200 OK with same ID
 		req2 := httptest.NewRequest(http.MethodPost, "/events", bytes.NewBufferString(body))
@@ -131,11 +171,15 @@ func TestCreateEvent(t *testing.T) {
 		if ev1.ID != ev2.ID {
 			t.Fatalf("expected identical event ids on duplicate key: %q != %q", ev1.ID, ev2.ID)
 		}
+		// Must not publish again on duplicate
+		if len(pub.published) != 1 {
+			t.Fatalf("published count after req2 = %d, want 1", len(pub.published))
+		}
 	})
 
 	t.Run("missing header returns 400", func(t *testing.T) {
 		store := newMockEventStore()
-		handler := CreateEvent(store)
+		handler := CreateEvent(store, nil)
 
 		body := `{"endpoint_id":"` + validEndpointID + `","payload":{"test":true}}`
 		req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewBufferString(body))
@@ -152,7 +196,7 @@ func TestCreateEvent(t *testing.T) {
 	t.Run("oversized body is rejected", func(t *testing.T) {
 		store := newMockEventStore()
 		store.endpoints[validEndpointID] = true
-		handler := CreateEvent(store)
+		handler := CreateEvent(store, nil)
 
 		// Create body larger than 1 MB
 		hugePayload := strings.Repeat("A", 1024*1024+50)
@@ -172,7 +216,7 @@ func TestCreateEvent(t *testing.T) {
 	t.Run("non-existent endpoint returns 404", func(t *testing.T) {
 		store := newMockEventStore()
 		// endpoint not registered in store
-		handler := CreateEvent(store)
+		handler := CreateEvent(store, nil)
 
 		body := `{"endpoint_id":"` + validEndpointID + `","payload":{"test":true}}`
 		req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewBufferString(body))

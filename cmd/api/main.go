@@ -14,6 +14,7 @@ import (
 	"github.com/divs-lab/webhook-server/internal/config"
 	"github.com/divs-lab/webhook-server/internal/db"
 	"github.com/divs-lab/webhook-server/internal/handlers"
+	"github.com/divs-lab/webhook-server/internal/queue"
 )
 
 func main() {
@@ -58,12 +59,18 @@ func run() error {
 	endpointRepo := db.NewEndpointRepo(pool)
 	eventRepo := db.NewEventRepo(pool)
 
+	publisher, err := queue.NewPublisher(cfg.RabbitMQURL)
+	if err != nil {
+		return fmt.Errorf("connect rabbitmq publisher: %w", err)
+	}
+	defer publisher.Close()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handlers.Health(pool))
 	mux.HandleFunc("POST /endpoints", handlers.CreateEndpoint(endpointRepo))
 	mux.HandleFunc("GET /endpoints", handlers.ListEndpoints(endpointRepo))
 	mux.HandleFunc("GET /endpoints/{id}", handlers.GetEndpoint(endpointRepo))
-	mux.HandleFunc("POST /events", handlers.CreateEvent(eventRepo))
+	mux.HandleFunc("POST /events", handlers.CreateEvent(eventRepo, publisher))
 	mux.HandleFunc("GET /events/{id}", handlers.GetEvent(eventRepo))
 
 	handler := handlers.RequireAuth(cfg.APIKey)(mux)

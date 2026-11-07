@@ -94,3 +94,8 @@ func (r *EndpointRepo) Get(ctx context.Context, id string) (Endpoint, error) {
 	}
 	return ep, nil
 }
+
+// GetEndpoint is an alias for Get.
+func (r *EndpointRepo) GetEndpoint(ctx context.Context, id string) (Endpoint, error) {
+	return r.Get(ctx, id)
+}
